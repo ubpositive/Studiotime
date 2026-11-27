@@ -148,20 +148,14 @@ async function main() {
   }
   // Any other id referenced anywhere (Project leader/assigned, TimesheetEntry
   // user/approver, TaskAssignment assignee/assigner, UserPermission.user_id)
-  // that still has no user row gets a clearly-flagged placeholder.
+  // that still has no user row gets collected here rather than given its own
+  // placeholder -- per your call, these are presumed old test data with no
+  // real identity behind them, so every one of them is folded into a single
+  // shared "legacy data" account below instead of 8 separate fake people.
   function ensurePlaceholder(oldId) {
     if (!oldId || oldId.startsWith('service_')) return;
     if (usersById.has(oldId)) return;
     report.unresolvedUsers.add(oldId);
-    usersById.set(oldId, {
-      oldId,
-      email: `needs-email+${oldId.slice(-6)}@studiotime.import`,
-      full_name: null,
-      role: 'user',
-      approved: false,
-      account_status: 'active',
-      source: 'placeholder',
-    });
   }
   for (const p of projects) {
     ensurePlaceholder(p.project_leader_id);
@@ -182,6 +176,29 @@ async function main() {
   for (const up of userPermissions) {
     ensurePlaceholder(up.user_id);
     ensurePlaceholder(up.created_by_id);
+  }
+
+  // Fold every unresolved id into ONE shared "legacy data" account rather
+  // than a placeholder per id -- these are presumed old test data with no
+  // real identity behind them (none hold a UserPermission override, approve
+  // anything, lead a project, or get assigned a task -- they only show up as
+  // project members and as the owner of logged timesheet hours), so there's
+  // one place to look at all of it and decide whether to delete it.
+  // account_status: 'disabled' means this account can never log in --
+  // server/auth.js rejects any login/session check once that's set.
+  const LEGACY_DUMMY_OLD_ID = '__legacy_test_data__';
+  if (report.unresolvedUsers.size) {
+    usersById.set(LEGACY_DUMMY_OLD_ID, {
+      oldId: LEGACY_DUMMY_OLD_ID,
+      email: 'legacy-test-data@studiotime.import',
+      full_name: 'Legacy / unassigned test data (review before cutover)',
+      role: 'user',
+      approved: false,
+      account_status: 'disabled',
+      source: 'legacy-dummy',
+    });
+    const dummyNewId = newId(LEGACY_DUMMY_OLD_ID);
+    for (const oldId of report.unresolvedUsers) idMap.set(oldId, dummyNewId);
   }
 
   // UserPermission.updated_by is, unlike every other "_by"/"_by_id" field in
@@ -238,7 +255,10 @@ async function main() {
 
     // 3) projects
     for (const p of projects) {
-      const assignedMembers = toJson(p.assigned_members, []).map((uid) => newId(uid));
+      // Dedupe: several distinct Base44 test ids can collapse onto the same
+      // shared "legacy data" account, which would otherwise list it twice in
+      // one project's assigned_members.
+      const assignedMembers = [...new Set(toJson(p.assigned_members, []).map((uid) => newId(uid)))];
       const memberAssignments = toJson(p.member_assignments, []).map((w) => ({ ...w, user_id: newId(w.user_id) }));
       await client.query(
         `INSERT INTO projects (id, name, client, description, reference_code, location, project_type, status,
@@ -378,14 +398,16 @@ async function main() {
   console.log();
   for (const [table, n] of Object.entries(report.counts)) console.log(`  ${table.padEnd(22)} ${n}`);
   console.log();
-  console.log(`Users resolved: ${usersById.size} total`);
+  console.log(`Users created: ${usersById.size} real account(s)`);
   console.log(`  from --users file: ${[...usersById.values()].filter((u) => u.source === 'users-file').length}`);
   console.log(`  from TeamMember (real email): ${[...usersById.values()].filter((u) => u.source === 'team-member').length}`);
-  console.log(`  PLACEHOLDER (unresolved, needs real data): ${report.unresolvedUsers.size}`);
   if (report.unresolvedUsers.size) {
-    console.log('\n  Unresolved Base44 user ids (referenced in Project/TimesheetEntry/TaskAssignment/');
-    console.log('  UserPermission, but with no TeamMember row and no --users file entry):');
-    for (const id of report.unresolvedUsers) console.log(`    ${id}`);
+    console.log(`  + 1 shared "legacy data" account (account_status=disabled, can't log in) standing in for`);
+    console.log(`    ${report.unresolvedUsers.size} Base44 user id(s) referenced in Project/TimesheetEntry/`);
+    console.log('    TaskAssignment/UserPermission with no TeamMember row and no --users file entry --');
+    console.log('    presumed old test data. Review timesheet_entries and projects.assigned_members for this');
+    console.log('    account before a real cutover and delete what you don\'t want to keep. Original ids:');
+    for (const id of report.unresolvedUsers) console.log(`      ${id}`);
   }
   if (report.warnings.length) {
     console.log(`\nWarnings (${report.warnings.length}):`);
