@@ -15,6 +15,9 @@ import { query } from '../db.js';
 import { requireAuth } from '../auth.js';
 import { resolveTier, canAssignRole, isAdminLevelRole } from '../lib/roles.js';
 import { loadCallerContext } from '../lib/callerContext.js';
+import { toPublicUser } from '../auth.js';
+
+const PLATFORM_ROLES = ['user', 'admin'];
 import { loadFinancialScope, canExposeRates } from '../lib/financialPerms.js';
 import { resolveApprovalScope, entryInApprovalScope } from '../lib/approvalScope.js';
 
@@ -107,6 +110,40 @@ teamMembersRouter.get('/users', async (req, res, next) => {
       })));
     }
     res.json(rows.map((u) => ({ id: u.id, full_name: u.full_name })));
+  } catch (err) { next(err); }
+});
+
+// Approve a pending registration, or change a platform role (user/admin).
+// Not one of the 17 ported Base44 functions by name — in the live app this
+// was Base44's own built-in User-management screen (platform-level
+// approve/role, outside the custom backend functions discovery captured),
+// so it needs an equivalent here. Platform-admin-only, same as the sibling
+// apps' usersRouter.put.
+teamMembersRouter.put('/users/:id', async (req, res, next) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'Not allowed' });
+    const { role, approved, full_name } = req.body || {};
+    if (role !== undefined && !PLATFORM_ROLES.includes(role)) return res.status(400).json({ message: 'Invalid role' });
+    if (req.params.id === req.user.id && role !== undefined && role !== req.user.role) {
+      return res.status(400).json({ message: "You can't change your own role" });
+    }
+    const sets = [];
+    const values = [];
+    if (role !== undefined) { values.push(role); sets.push(`role = $${values.length}`); }
+    if (approved !== undefined) { values.push(!!approved); sets.push(`approved = $${values.length}`); }
+    if (full_name !== undefined) { values.push(full_name); sets.push(`full_name = $${values.length}`); }
+    if (!sets.length) {
+      const { rows } = await query('SELECT * FROM users WHERE id = $1', [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ message: 'Not found' });
+      return res.json(toPublicUser(rows[0]));
+    }
+    values.push(req.params.id);
+    const { rows } = await query(
+      `UPDATE users SET ${sets.join(', ')}, updated_date = now() WHERE id = $${values.length} RETURNING *`,
+      values
+    );
+    if (!rows[0]) return res.status(404).json({ message: 'Not found' });
+    res.json(toPublicUser(rows[0]));
   } catch (err) { next(err); }
 });
 
